@@ -211,6 +211,7 @@ __marimo__/
 
 # output files
 output/
+test_output/
 **/.DS_Store
 
 # vscode

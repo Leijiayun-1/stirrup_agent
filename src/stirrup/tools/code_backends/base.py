@@ -28,7 +28,9 @@ class CodeExecutionParams(BaseModel):
             description=(
                 "Shell command to execute (bash syntax). "
                 "IMPORTANT: Use only relative paths. Do not use absolute paths "
-                "(starting with / or ~) or reference directories outside the working directory."
+                "(starting with / or ~) or reference directories outside the working directory. "
+                "For multiline Python, write a .py file and run it, or use a heredoc "
+                "(python3 << 'EOF' ... EOF). Never use python3 -c with complex scripts."
             )
         ),
     ]

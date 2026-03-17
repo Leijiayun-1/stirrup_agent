@@ -71,6 +71,7 @@ class ChatCompletionsClient(LLMClient):
         reasoning_effort: str | None = None,
         timeout: float | None = None,
         max_retries: int = 2,
+        flatten_tool_content: bool = False,
         kwargs: dict[str, Any] | None = None,
     ) -> None:
         """Initialize OpenAI SDK client with model configuration.
@@ -87,11 +88,15 @@ class ChatCompletionsClient(LLMClient):
             timeout: Request timeout in seconds. If None, uses OpenAI SDK default.
             max_retries: Number of retries for transient errors. Defaults to 2.
                 The OpenAI SDK handles retries internally with exponential backoff.
+            flatten_tool_content: If True, flatten tool message content from list
+                format to plain string. Required for providers that do not support
+                the content-array format for tool messages (e.g., DeepSeek).
             kwargs: Additional arguments passed to chat.completions.create().
         """
         self._model = model
         self._max_tokens = max_tokens
         self._reasoning_effort = reasoning_effort
+        self._flatten_tool_content = flatten_tool_content
         self._kwargs = kwargs or {}
 
         # Initialize AsyncOpenAI client
@@ -148,9 +153,17 @@ class ChatCompletionsClient(LLMClient):
             ContextOverflowError: If the context window is exceeded.
         """
         # Build request kwargs
+        openai_messages = to_openai_messages(messages)
+        if self._flatten_tool_content:
+            for msg in openai_messages:
+                if msg.get("role") == "tool" and isinstance(msg.get("content"), list):
+                    msg["content"] = " ".join(
+                        block.get("text", "") for block in msg["content"] if isinstance(block, dict)
+                    )
+
         request_kwargs: dict[str, Any] = {
             "model": self._model,
-            "messages": to_openai_messages(messages),
+            "messages": openai_messages,
             "max_completion_tokens": self._max_tokens,
             **self._kwargs,
         }
@@ -170,15 +183,6 @@ class ChatCompletionsClient(LLMClient):
         request_end_time = perf_counter()
 
         choice = response.choices[0]
-
-        # Check for context overflow
-        if choice.finish_reason in ("max_tokens", "length"):
-            raise ContextOverflowError(
-                f"Maximal context window tokens reached for model {self.model_slug}, "
-                f"resulting in finish reason: {choice.finish_reason}. "
-                "Reduce agent.max_tokens and try again."
-            )
-
         msg = choice.message
 
         # Parse reasoning content (for o1/o3 models with extended thinking)
@@ -200,6 +204,25 @@ class ChatCompletionsClient(LLMClient):
         usage = response.usage
         input_tokens = usage.prompt_tokens if usage else 0
         output_tokens = usage.completion_tokens if usage else 0
+
+        # Distinguish output-truncation from true context-window overflow:
+        #   - output_tokens >= max_completion_tokens  →  we hit our own output limit;
+        #     the response is valid (just partial), return it and let the agent continue.
+        #   - output_tokens < max_completion_tokens   →  the model's context window was
+        #     genuinely exhausted by the input; raise so the agent can summarise history.
+        if choice.finish_reason in ("max_tokens", "length"):
+            if output_tokens >= self._max_tokens:
+                LOGGER.warning(
+                    "Output truncated at max_tokens=%d for model %s; returning partial response.",
+                    self._max_tokens,
+                    self.model_slug,
+                )
+            else:
+                raise ContextOverflowError(
+                    f"Maximal context window tokens reached for model {self.model_slug}, "
+                    f"resulting in finish reason: {choice.finish_reason}. "
+                    "Reduce agent.max_tokens and try again."
+                )
 
         # Handle reasoning tokens if available (for o1/o3 models)
         reasoning_tokens = 0

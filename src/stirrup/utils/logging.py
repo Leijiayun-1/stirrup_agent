@@ -870,8 +870,13 @@ class AgentLogger(AgentLoggerBase):
             for tc in assistant_message.tool_calls:
                 content.append(f"  🔧 {tc.name}", style="magenta")
                 if tc.arguments and tc.arguments.strip():
-                    args_parsed = json.loads(tc.arguments)
-                    args_formatted = json.dumps(args_parsed, indent=2, ensure_ascii=False)
+                    # Be defensive: tool arguments might not be valid JSON (provider bugs / malformed output).
+                    try:
+                        args_parsed = json.loads(tc.arguments)
+                        args_formatted = json.dumps(args_parsed, indent=2, ensure_ascii=False)
+                    except json.JSONDecodeError:
+                        # Fallback to raw string preview instead of crashing the whole agent run.
+                        args_formatted = tc.arguments
                     args_preview = args_formatted[:1000] + "..." if len(args_formatted) > 1000 else args_formatted
                     content.append(args_preview, style="dim")
 

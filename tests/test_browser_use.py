@@ -5,6 +5,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+pytest.importorskip("browser_use")
+
 from stirrup.tools.browser_use import (
     BrowserUseToolProvider,
     EmptyParams,

@@ -95,9 +95,13 @@ LOGGER = logging.getLogger(__name__)
 def _num_turns_remaining_msg(number_of_turns_remaining: int) -> UserMessage:
     """Create a user message warning the agent about remaining turns before max_turns is reached."""
     if number_of_turns_remaining == 1:
-        return UserMessage(content="This is the last turn. Please finish the task by calling the finish tool.")
+        return UserMessage(content="This is the last turn. You must call the finish tool now.")
+    if number_of_turns_remaining <= 3:
+        return UserMessage(
+            content=f"You have {number_of_turns_remaining} turns remaining. Wrap up now and call the finish tool on the next turn.",
+        )
     return UserMessage(
-        content=f"You have {number_of_turns_remaining} turns remaining to complete the task. Please continue. Remember you will need a separate turn to finish the task.",
+        content=f"You have {number_of_turns_remaining} turns remaining. If the core deliverables are ready, call the finish tool. Do not create extra files.",
     )
 
 
