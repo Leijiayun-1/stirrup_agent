@@ -1,0 +1,76 @@
+profile_version: 1
+spec_path: docs/autoresearch/specs/2026-04-16-semantic-state-tracking-design.md
+plan_path: docs/autoresearch/plans/2026-04-26-semantic-state-tracking-plan.md
+compatibility_label: v1-bootstrap-fit
+
+runtime:
+  manager: uv
+  env_prep_command: uv pip install -e '.[all]'
+  entry_command: python scripts/autoresearch_run.py --task-ids-file evals/gdpval/task_lists/fast_subset.txt
+  timeout_seconds: 1200
+  log_path: logs/autoresearch/{branch}/{timestamp}/run.log
+
+experiment:
+  time_budget_seconds: 12000
+  metric_name: aggregate_score
+  metric_direction: higher
+  variables:
+    state_trigger:
+      - every_turn
+      - after_file_parse
+      - after_tool_success
+    extractor_freq:
+      - every_turn
+      - every_3_turns
+      - only_when_agent_silent
+    inject_position:
+      - system_message
+      - user_message_prefix
+      - after_tool_result
+    state_granularity:
+      - data_fact+task_constraint
+      - data_fact+task_constraint+env_state
+
+edit_scope:
+  allowed_paths:
+    - src/stirrup/prompts/base_system_prompt.txt
+    - src/stirrup/core/semantic_state.py
+    - src/stirrup/core/agent.py
+  readonly_paths:
+    - evals/
+    - src/stirrup/clients/
+    - src/stirrup/tools/
+    - tests/
+    - pyproject.toml
+  primary_edit_target: src/stirrup/prompts/base_system_prompt.txt
+
+baseline:
+  must_run_first: true
+  protocol: Run current codebase (no semantic state changes) on fast_subset tasks with grading enabled. Record aggregate_score as reference.
+  baseline_description: Current Stirrup agent with unmodified base_system_prompt.txt, no semantic state management.
+
+git_policy:
+  branch_prefix: autoresearch/semantic-state
+  commit_before_run: true
+  keep_commit_strategy: keep-current-commit
+  discard_strategy: hard-reset-to-pre-run-commit
+  crash_strategy: keep-crash-commit-for-inspection
+
+logging:
+  run_log_path: logs/autoresearch/<branch>/<timestamp>/run.log
+  summary_extract_command: python3 -c "import re, sys
+for line in sys.stdin:
+    m = re.search(r'metric=(\\d+)', line)
+    if m:
+        print(m.group(1))"
+  results_columns:
+    - run_id
+    - commit_sha
+    - aggregate_score
+    - delta_vs_baseline
+    - state_trigger
+    - extractor_freq
+    - inject_position
+    - state_granularity
+    - runtime_seconds
+    - notes
