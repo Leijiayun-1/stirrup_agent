@@ -1,0 +1,14 @@
+run_id: 2026-04-26-loop-0001
+attempt_id: 2
+description: Clarify semantic-state control protocol in the base system prompt so the model knows how to react to stale state, auto-corrections, disputes, and rollback notices.
+proposal:
+  kind: prompt_adjustment
+  rationale: The semantic-state runtime now supports auto-correction, dispute, rollback, and stale-state handling, but the prompt only described state_update. This change aligns the model-facing protocol with the implemented control flow.
+  files:
+    - src/stirrup/prompts/base_system_prompt.txt
+pre_run_commit: 37757787e676a1d5eb3154c250f81ed11bea5839
+baseline_ref: 4d90d39ae62775ebfcc0421294739b58a7098bde
+entry_command: python scripts/autoresearch_run.py --task-ids-file evals/gdpval/task_lists/fast_subset.txt
+log_path: logs/autoresearch/autoresearch_semantic-state-bootstrap/20260426T090423Z/run.log
+status: crash
+status_reason: Outer 1200s timeout ended the batch after task 3 reached turn 19/30 and failed on reportlab Canvas.moveTo.

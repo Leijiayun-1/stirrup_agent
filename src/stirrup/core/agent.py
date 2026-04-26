@@ -200,6 +200,30 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
         return None
 
 
+def _format_planner_summary(plan_artifact: Any) -> str:
+    """Format a concise planner summary for the run log."""
+    deliverables = ", ".join(
+        deliverable.name for deliverable in plan_artifact.deliverables[:3] if getattr(deliverable, "name", None)
+    ) or "none"
+    phases = ", ".join(
+        f"{phase.name}({phase.turn_budget})" for phase in plan_artifact.phases[:4] if getattr(phase, "name", None)
+    ) or "none"
+    rules = ", ".join(rule.rule_id for rule in plan_artifact.key_rules[:4] if getattr(rule, "rule_id", None)) or "none"
+    risks = ", ".join(plan_artifact.risk_flags[:3]) or "none"
+    understanding = plan_artifact.task_understanding.strip()
+    if len(understanding) > 180:
+        understanding = understanding[:177] + "..."
+    return (
+        "<planner_artifact>\n"
+        f"task_understanding={understanding}\n"
+        f"deliverables={deliverables}\n"
+        f"phases={phases}\n"
+        f"key_rules={rules}\n"
+        f"risk_flags={risks}\n"
+        "</planner_artifact>"
+    )
+
+
 class SubAgentParams(BaseModel):
     """Parameters for sub-agent tool invocation."""
 
@@ -1226,10 +1250,11 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
             if state and state.uploaded_file_paths:
                 uploaded_files = list(state.uploaded_file_paths)
             task_description = init_msgs if isinstance(init_msgs, str) else str(init_msgs[-1].content)
+            self._logger.info("Running planner for %s uploaded file(s)", len(uploaded_files))
             planner = Planner(self._client, max_turns=self._max_turns)
             plan_artifact = await planner.plan(task_description=task_description, uploaded_files=uploaded_files)
             self._semantic_state_manager = SemanticStateManager(plan_artifact)
-            run_metadata.setdefault("planner", []).append(plan_artifact.model_dump())
+            run_metadata.setdefault("_planner", []).append(plan_artifact.model_dump())
 
             # Build the complete system prompt (base + input files + user instructions)
             full_system_prompt = self._build_system_prompt()
@@ -1250,6 +1275,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         # Log the task at run start (only if not resuming)
         if not resumed:
             self._logger.task_message(task_description)
+            self._logger.user_message(UserMessage(content=_format_planner_summary(plan_artifact)))
 
         # Show warnings (top-level only, if logger supports it)
         if self._logger.depth == 0 and isinstance(self._logger, AgentLogger):
@@ -1324,7 +1350,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                         disputes,
                         turn_index=i + 1,
                     )
-                    run_metadata.setdefault("semantic_state_events", []).append(
+                    run_metadata.setdefault("_semantic_state_events", []).append(
                         {
                             "turn": i + 1,
                             "disputes": disputes,
@@ -1356,7 +1382,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                     violation_artifact,
                     turn_index=i + 1,
                 )
-                run_metadata.setdefault("semantic_state_events", []).append(
+                run_metadata.setdefault("_semantic_state_events", []).append(
                     {
                         "turn": i + 1,
                         "extractor": extractor_artifact.model_dump(),
@@ -1364,7 +1390,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                         "outcome": violation_outcome,
                     }
                 )
-                run_metadata.setdefault("semantic_state", []).append(
+                run_metadata.setdefault("_semantic_state", []).append(
                     self._semantic_state_manager.serialize_persistent_state()
                 )
 

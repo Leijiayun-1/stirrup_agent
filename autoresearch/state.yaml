@@ -1,12 +1,16 @@
-current_stage: bootstrap
-stage_status: pending
+current_stage: autoresearch-loop
+stage_status: completed
 active_spec_path: docs/autoresearch/specs/2026-04-16-semantic-state-tracking-design.md
 active_plan_path: docs/autoresearch/plans/2026-04-26-semantic-state-tracking-plan.md
 bootstrap_status: completed
-baseline_status: pending
+baseline_status: validated
 active_profile_path: autoresearch/profile.yaml
-baseline_ref: null
+baseline_ref: 4d90d39ae62775ebfcc0421294739b58a7098bde
+active_run_manifest: autoresearch/runs/2026-04-26-loop-0001.yaml
 next_allowed_skills:
-  - autoresearch-bootstrap
+  - autoresearch-loop
 rollback_target: null
 blocker_reason: null
+experiment_status: crash
+last_run_status: crash
+rejection_streak: 1
