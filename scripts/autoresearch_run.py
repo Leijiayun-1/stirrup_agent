@@ -95,6 +95,10 @@ def main() -> int:
         return 2
 
     aggregate_score = _compute_aggregate_score(results_path)
+    with log_path.open("a", encoding="utf-8") as log_file:
+        log_file.write(f"run_dir={run_dir}\n")
+        log_file.write(f"log_path={log_path}\n")
+        log_file.write(f"metric={aggregate_score}\n")
     print(f"run_dir={run_dir}")
     print(f"log_path={log_path}")
     print(f"metric={aggregate_score}")
