@@ -11,6 +11,7 @@ from stirrup.core.agent import Agent
 from stirrup.core.models import TokenUsage
 from stirrup.tools.code_backends.local import LocalCodeExecToolProvider
 from stirrup.tools.finish import SIMPLE_FINISH_TOOL
+from stirrup.tools.web import WebToolProvider
 
 from .loader import download_reference_files
 
@@ -27,6 +28,10 @@ async def run_task(
     use_local: bool = False,
     visualize: bool = False,
     max_tokens: int | None = None,
+    grade: bool = False,
+    grading_model: str | None = None,
+    grading_api_key: str | None = None,
+    grading_base_url: str | None = None,
 ) -> dict[str, Any]:
     """Run a single GDPVal task and return a structured result.
 
@@ -100,7 +105,7 @@ async def run_task(
     agent = Agent(
         client=client,
         name="gdpval-agent",
-        tools=[exec_provider],
+        tools=[exec_provider, WebToolProvider()],
         finish_tool=SIMPLE_FINISH_TOOL,
         logger=logger_for_agent,
     )
@@ -137,6 +142,30 @@ async def run_task(
         reason = finish_params.reason if finish_params else "No finish tool called"
         success = finish_params is not None
 
+        # Grading
+        grade_result = None
+        if grade:
+            from .grader import grade_task as _grade_task
+            from .loader import download_deliverable_files
+
+            deliverable_dir = task_output_dir / "deliverables"
+            try:
+                await download_deliverable_files(task, deliverable_dir)
+            except Exception as exc:
+                logger.warning("Task %s: failed to download deliverable files: %s", task_id, exc)
+
+            try:
+                grade_result = await _grade_task(
+                    task=task,
+                    output_dir=task_output_dir,
+                    model=grading_model or model,
+                    api_key=grading_api_key or api_key,
+                    base_url=grading_base_url or base_url,
+                    deliverable_dir=deliverable_dir,
+                )
+            except Exception as exc:
+                logger.exception("Task %s: grading failed: %s", task_id, exc)
+
         return {
             "task_id": task_id,
             "sector": sector,
@@ -150,6 +179,10 @@ async def run_task(
                 "reasoning": total_reasoning,
             },
             "error": None,
+            "score": grade_result.score if grade_result else None,
+            "max_score": grade_result.max_score if grade_result else None,
+            "rubric_results": [r.model_dump() for r in grade_result.rubric_results] if grade_result else None,
+            "grading_token_usage": grade_result.grading_token_usage if grade_result else None,
         }
 
     except Exception as exc:

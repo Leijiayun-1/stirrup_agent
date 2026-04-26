@@ -29,7 +29,11 @@ logger = logging.getLogger(__name__)
 
 
 def _load_completed_task_ids(results_path: Path) -> set[str]:
-    """Load already-completed task IDs from an existing results.jsonl file."""
+    """Load successfully-completed task IDs from an existing results.jsonl file.
+
+    Only tasks with success=True are considered completed. Failed tasks will be
+    retried on the next run.
+    """
     completed: set[str] = set()
     if not results_path.exists():
         return completed
@@ -41,7 +45,7 @@ def _load_completed_task_ids(results_path: Path) -> set[str]:
             try:
                 record = json.loads(line)
                 task_id = record.get("task_id")
-                if task_id:
+                if task_id and record.get("success"):
                     completed.add(task_id)
             except json.JSONDecodeError:
                 pass
@@ -60,6 +64,10 @@ async def _run_all(
     results_path: Path,
     visualize: bool = False,
     max_tokens: int | None = None,
+    grade: bool = False,
+    grading_model: str | None = None,
+    grading_api_key: str | None = None,
+    grading_base_url: str | None = None,
 ) -> None:
     """Run all tasks with bounded concurrency, appending results to results.jsonl."""
     from .runner import run_task
@@ -83,6 +91,10 @@ async def _run_all(
                     use_local=use_local,
                     visualize=visualize,
                     max_tokens=max_tokens,
+                    grade=grade,
+                    grading_model=grading_model,
+                    grading_api_key=grading_api_key,
+                    grading_base_url=grading_base_url,
                 )
                 async with results_lock:
                     results_file.write(json.dumps(result) + "\n")
@@ -138,6 +150,26 @@ def main() -> None:
         "--visualize",
         action="store_true",
         help="Enable web visualization of agent tools and LLM outputs",
+    )
+    parser.add_argument(
+        "--grade",
+        action="store_true",
+        help="Run LLM-as-Judge grading after each task completes",
+    )
+    parser.add_argument(
+        "--grading-model",
+        default=None,
+        help="Model for grading (defaults to --model)",
+    )
+    parser.add_argument(
+        "--grading-api-key",
+        default=None,
+        help="API key for grading LLM (defaults to --api-key)",
+    )
+    parser.add_argument(
+        "--grading-base-url",
+        default=None,
+        help="Base URL for grading LLM (defaults to --base-url)",
     )
     args = parser.parse_args()
 
@@ -206,6 +238,10 @@ def main() -> None:
                 results_path=results_path,
                 visualize=args.visualize,
                 max_tokens=args.max_tokens,
+                grade=args.grade,
+                grading_model=args.grading_model,
+                grading_api_key=args.grading_api_key,
+                grading_base_url=args.grading_base_url,
             )
         )
     finally:
@@ -215,6 +251,30 @@ def main() -> None:
     # Print summary
     completed_count = sum(1 for _ in _load_completed_task_ids(results_path))
     logger.info("Done. %d tasks recorded in %s", completed_count, results_path)
+
+    # Print grading summary if grading was enabled
+    if args.grade:
+        total_score = 0
+        total_max = 0
+        graded_count = 0
+        with results_path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                    if r.get("score") is not None:
+                        total_score += r["score"]
+                        total_max += r["max_score"]
+                        graded_count += 1
+                except json.JSONDecodeError:
+                    pass
+        if graded_count:
+            logger.info(
+                "Grading summary: %d/%d (%.1f%%) across %d tasks",
+                total_score, total_max, 100 * total_score / total_max if total_max else 0, graded_count,
+            )
 
 
 if __name__ == "__main__":

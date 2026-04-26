@@ -1,0 +1,8 @@
+current_stage: planning
+stage_status: completed
+active_spec_path: docs/autoresearch/specs/2026-04-16-semantic-state-tracking-design.md
+active_plan_path: docs/autoresearch/plans/2026-04-26-semantic-state-tracking-plan.md
+next_allowed_skills:
+  - autoresearch-bootstrap
+rollback_target: null
+blocker_reason: "Bootstrap precondition failed: working tree is not clean and current branch is main. Commit or stash changes, switch to a named non-main branch, then rerun autoresearch-bootstrap."

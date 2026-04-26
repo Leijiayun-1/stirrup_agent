@@ -61,36 +61,29 @@ def load_gdpval_tasks(
     return tasks
 
 
-async def download_reference_files(task: dict[str, Any], dest_dir: Path) -> list[Path]:
-    """Download reference files for a task.
+async def _download_files(
+    urls: list[str],
+    inline_files: list[Any],
+    dest_dir: Path,
+) -> list[Path]:
+    """Shared download logic for reference and deliverable files.
 
-    Downloads files from task["reference_file_urls"] (URLs) and writes
-    task["reference_files"] (inline content) to dest_dir.
+    Downloads files from URLs and writes inline content to dest_dir.
     Skips files that already exist (resume-friendly).
-
-    Args:
-        task: Task dict from the GDPVal dataset.
-        dest_dir: Local directory to download files into.
-
-    Returns:
-        List of paths to downloaded/written reference files.
     """
     try:
         import httpx
     except ImportError as e:
-        raise ImportError("httpx is required for downloading reference files.") from e
+        raise ImportError("httpx is required for downloading files.") from e
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     downloaded: list[Path] = []
 
-    # Download URL-based reference files
-    reference_file_urls: list[str] = task.get("reference_file_urls") or []
-    if reference_file_urls:
+    if urls:
         async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
-            for url in reference_file_urls:
+            for url in urls:
                 mirrored_url = _apply_hf_mirror(url)
-                filename = url.split("/")[-1].split("?")[0] or "reference_file"
-                # URL-decode percent-encoded filename (e.g. %20 -> space)
+                filename = url.split("/")[-1].split("?")[0] or "file"
                 try:
                     from urllib.parse import unquote
                     filename = unquote(filename)
@@ -112,15 +105,12 @@ async def download_reference_files(task: dict[str, Any], dest_dir: Path) -> list
                 except Exception as exc:
                     logger.warning("Failed to download %s: %s", mirrored_url, exc)
 
-    # Write inline reference files (may be dicts with filename/content, or just filenames)
-    reference_files: list[Any] = task.get("reference_files") or []
-    for ref_file in reference_files:
-        if isinstance(ref_file, str):
-            # Just a filename string — no inline content to write
+    for item in inline_files:
+        if isinstance(item, str):
             continue
 
-        filename: str = ref_file.get("filename", "reference_file")
-        content: str | bytes | None = ref_file.get("content")
+        filename: str = item.get("filename", "file")
+        content: str | bytes | None = item.get("content")
 
         if not content:
             continue
@@ -139,3 +129,31 @@ async def download_reference_files(task: dict[str, Any], dest_dir: Path) -> list
         downloaded.append(dest_path)
 
     return downloaded
+
+
+async def download_reference_files(task: dict[str, Any], dest_dir: Path) -> list[Path]:
+    """Download reference files for a task.
+
+    Downloads files from task["reference_file_urls"] (URLs) and writes
+    task["reference_files"] (inline content) to dest_dir.
+    Skips files that already exist (resume-friendly).
+    """
+    return await _download_files(
+        urls=task.get("reference_file_urls") or [],
+        inline_files=task.get("reference_files") or [],
+        dest_dir=dest_dir,
+    )
+
+
+async def download_deliverable_files(task: dict[str, Any], dest_dir: Path) -> list[Path]:
+    """Download deliverable (reference answer) files for a task.
+
+    Downloads files from task["deliverable_file_urls"] (URLs) and writes
+    task["deliverable_files"] (inline content) to dest_dir.
+    Skips files that already exist (resume-friendly).
+    """
+    return await _download_files(
+        urls=task.get("deliverable_file_urls") or [],
+        inline_files=task.get("deliverable_files") or [],
+        dest_dir=dest_dir,
+    )
