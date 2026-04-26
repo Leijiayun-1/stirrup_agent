@@ -133,6 +133,48 @@ def _get_nested_tools(data: object) -> dict[str, object]:
     return {}
 
 
+def _coerce_metadata_dict(item: object) -> dict[str, Any] | None:
+    """Best-effort conversion of logger metadata entries into plain dicts."""
+    if hasattr(item, "model_dump"):
+        return cast(Callable[[], dict[str, Any]], item.model_dump)()
+    if isinstance(item, dict):
+        return cast(dict[str, Any], item)
+    return None
+
+
+def _aggregate_tool_data_for_display(tool_data: list[object]) -> object | None:
+    """Aggregate tool metadata for display without assuming __add__ support.
+
+    Many built-in tool metadata types implement __add__, but some call sites append
+    plain dict payloads. Those should not crash the logger.
+    """
+    if not tool_data:
+        return None
+
+    try:
+        aggregated = _aggregate_list(tool_data)
+    except TypeError:
+        aggregated = None
+    if aggregated is not None:
+        return aggregated
+
+    dict_items = [_coerce_metadata_dict(item) for item in tool_data]
+    if all(item is not None for item in dict_items):
+        merged: dict[str, Any] = {"num_records": len(tool_data)}
+        total_uses = 0
+        saw_num_uses = False
+        for item in cast(list[dict[str, Any]], dict_items):
+            if isinstance(item.get("num_uses"), int):
+                total_uses += int(item["num_uses"])
+                saw_num_uses = True
+        if saw_num_uses:
+            merged["num_uses"] = total_uses
+        merged["sample"] = cast(list[dict[str, Any]], dict_items)[-1]
+        return merged
+
+    return {"num_records": len(tool_data), "sample": str(tool_data[-1])}
+
+
 def _add_tool_branch(
     parent: Tree,
     tool_name: str,
@@ -158,7 +200,7 @@ def _add_tool_branch(
         return
     # Case 1: List → aggregate using __add__, then recurse
     if isinstance(tool_data, list) and tool_data:
-        aggregated = _aggregate_list(tool_data)
+        aggregated = _aggregate_tool_data_for_display(tool_data)
         if aggregated is not None:
             _add_tool_branch(parent, tool_name, aggregated, skip_fields, tool_durations)
         return

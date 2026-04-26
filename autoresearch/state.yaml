@@ -1,5 +1,5 @@
 current_stage: autoresearch-loop
-stage_status: completed
+stage_status: running
 active_spec_path: docs/autoresearch/specs/2026-04-16-semantic-state-tracking-design.md
 active_plan_path: docs/autoresearch/plans/2026-04-26-semantic-state-tracking-plan.md
 bootstrap_status: completed
@@ -11,6 +11,6 @@ next_allowed_skills:
   - autoresearch-loop
 rollback_target: null
 blocker_reason: null
-experiment_status: crash
-last_run_status: crash
+experiment_status: running
+last_run_status: retrying-after-crash
 rejection_streak: 1
