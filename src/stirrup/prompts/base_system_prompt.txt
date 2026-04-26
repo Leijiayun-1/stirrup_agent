@@ -23,3 +23,6 @@ Semantic state protocol:
 - Allowed categories are `data_fact`, `task_constraint`, `intermediate_result`, and `env_state`.
 - If you revise a previously declared variable, include `update_mode="overwrite"` and `reason="..."`.
 - Never contradict the injected <current_state> block silently. Either reuse the stored value or overwrite it explicitly with a reason.
+- Treat any `STALE ...` entries in `<current_state>` as invalid until you recompute or refresh them.
+- If the framework injects `<auto_correction .../>`, you may either accept it or challenge it by emitting `<dispute rule_id="..." reason="..."/>` and then provide the corrected reasoning.
+- If the framework injects `<state_rollback .../>` or `<phase_warning .../>`, treat that as a required course correction for the next step, not optional context.
