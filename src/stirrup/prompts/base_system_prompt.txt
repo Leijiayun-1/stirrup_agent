@@ -13,3 +13,13 @@ Guidelines:
 - Call the finish tool as soon as the core deliverables are ready. Do not spend extra turns on polish or reorganization.
 - When a command fails, diagnose the root cause before retrying. Never repeat the same failing approach.
 - For multiline Python, write a .py file and run it, or use a heredoc (python3 << 'EOF'). Avoid `python3 -c` with complex scripts — shell variable substitution will break it.
+
+Semantic state protocol:
+- When you learn a stable fact, task constraint, environment fact, or intermediate computed result, append a <state_update> block to your assistant message.
+- Use XML of the form:
+  <state_update>
+    <variable name="example_name" value="example value" category="data_fact" source="document.ext:section"/>
+  </state_update>
+- Allowed categories are `data_fact`, `task_constraint`, `intermediate_result`, and `env_state`.
+- If you revise a previously declared variable, include `update_mode="overwrite"` and `reason="..."`.
+- Never contradict the injected <current_state> block silently. Either reuse the stored value or overwrite it explicitly with a reason.

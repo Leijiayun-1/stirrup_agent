@@ -2,6 +2,7 @@
 import contextvars
 import glob as glob_module
 import inspect
+import json
 import logging
 import re
 import signal
@@ -23,6 +24,8 @@ from stirrup.constants import (
     TURNS_REMAINING_WARNING_THRESHOLD,
 )
 from stirrup.core.cache import CacheManager, CacheState, compute_task_hash
+from stirrup.core.planner import Planner
+from stirrup.core.semantic_state import ExtractorArtifact, SemanticStateManager, ViolationArtifact
 from stirrup.core.models import (
     AssistantMessage,
     ChatMessage,
@@ -179,6 +182,24 @@ def _get_model_speed_stats(messages: list[list[ChatMessage]], model_slug: str) -
     }
 
 
+def _content_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(block for block in content if isinstance(block, str))
+    return str(content)
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        return json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
 class SubAgentParams(BaseModel):
     """Parameters for sub-agent tool invocation."""
 
@@ -307,6 +328,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         # Cache state for resumption (set during run(), used in __aexit__ for caching on interrupt)
         self._current_task_hash: str | None = None
         self._current_run_state: CacheState | None = None
+        self._semantic_state_manager: SemanticStateManager | None = None
 
     @property
     def name(self) -> str:
@@ -1057,6 +1079,80 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
 
         return [*task_context, summary_bridge, acknowledgement_msg]
 
+    async def _semantic_state_json_call(self, system_prompt: str, user_prompt: str) -> dict[str, Any] | None:
+        response = await self._client.generate(
+            [
+                SystemMessage(content=system_prompt),
+                UserMessage(content=user_prompt),
+            ],
+            {},
+        )
+        return _extract_json_object(_content_to_text(response.content))
+
+    async def _run_semantic_state_extractor(
+        self,
+        assistant_message: AssistantMessage,
+        tool_messages: list[ToolMessage],
+        turn_index: int,
+    ) -> ExtractorArtifact:
+        if self._semantic_state_manager is None:
+            return ExtractorArtifact()
+
+        system_prompt = (
+            "You are a semantic-state extractor. Return only JSON with the schema "
+            '{"variables":[{"name":"...","value":"...","category":"...","source":"...",'
+            '"update_mode":"initial","reason":null,"derived_from":["..."]}]}. '
+            "Extract stable variables present in tool results or the assistant reply that are missing from current state. "
+            "Do not repeat already-known variables unless a correction is clearly required."
+        )
+        user_prompt = (
+            f"Turn: {turn_index}\n\n"
+            f"Known variables:\n{self._semantic_state_manager.serialize_current_state()}\n\n"
+            f"Planned variables:\n{json.dumps(self._semantic_state_manager.planned_variables, ensure_ascii=True)}\n\n"
+            f"Assistant message:\n{_content_to_text(assistant_message.content)}\n\n"
+            f"Tool results:\n{json.dumps([_content_to_text(msg.content) for msg in tool_messages], ensure_ascii=True)}"
+        )
+        payload = await self._semantic_state_json_call(system_prompt, user_prompt)
+        if payload is None:
+            return ExtractorArtifact()
+        try:
+            return ExtractorArtifact.model_validate(payload)
+        except ValidationError:
+            return ExtractorArtifact()
+
+    async def _run_semantic_state_auditor(
+        self,
+        assistant_message: AssistantMessage,
+        tool_messages: list[ToolMessage],
+        turn_index: int,
+    ) -> ViolationArtifact:
+        if self._semantic_state_manager is None:
+            return ViolationArtifact()
+
+        system_prompt = (
+            "You are a semantic-state rule auditor. Return only JSON with the schema "
+            '{"violations":[{"rule_id":"...","severity":"soft|hard","message":"...",'
+            '"resolution_strategy":"follow_rule|auto_patch|rollback","rollback_turn":1,'
+            '"suggested_fix":[{"name":"...","value":"...","category":"...","source":"...",'
+            '"update_mode":"overwrite","reason":"...","derived_from":["..."]}]}]}. '
+            "Check the assistant reply and current state against the active rules. "
+            "Use follow_rule unless you have a strong reason to override the rule's configured strategy."
+        )
+        user_prompt = (
+            f"Turn: {turn_index}\n\n"
+            f"Active rules:\n{self._semantic_state_manager.serialize_active_rules()}\n\n"
+            f"Current state:\n{self._semantic_state_manager.serialize_current_state()}\n\n"
+            f"Assistant message:\n{_content_to_text(assistant_message.content)}\n\n"
+            f"Tool results:\n{json.dumps([_content_to_text(msg.content) for msg in tool_messages], ensure_ascii=True)}"
+        )
+        payload = await self._semantic_state_json_call(system_prompt, user_prompt)
+        if payload is None:
+            return ViolationArtifact()
+        try:
+            return ViolationArtifact.model_validate(payload)
+        except ValidationError:
+            return ViolationArtifact()
+
     async def run(
         self,
         init_msgs: str | list[ChatMessage],
@@ -1123,6 +1219,17 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
 
         if not resumed:
             msgs: list[ChatMessage] = []
+            run_metadata: dict[str, list[Any]] = {}
+
+            uploaded_files: list[str] = []
+            state = _SESSION_STATE.get(None)
+            if state and state.uploaded_file_paths:
+                uploaded_files = list(state.uploaded_file_paths)
+            task_description = init_msgs if isinstance(init_msgs, str) else str(init_msgs[-1].content)
+            planner = Planner(self._client, max_turns=self._max_turns)
+            plan_artifact = await planner.plan(task_description=task_description, uploaded_files=uploaded_files)
+            self._semantic_state_manager = SemanticStateManager(plan_artifact)
+            run_metadata.setdefault("planner", []).append(plan_artifact.model_dump())
 
             # Build the complete system prompt (base + input files + user instructions)
             full_system_prompt = self._build_system_prompt()
@@ -1132,9 +1239,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                 msgs.append(UserMessage(content=init_msgs))
             else:
                 msgs.extend(init_msgs)
-
-            # Local metadata storage - isolated per run() invocation for thread safety
-            run_metadata: dict[str, list[Any]] = {}
+            msgs.append(UserMessage(content=self._semantic_state_manager.build_turn_context(1)))
 
             full_msg_history: list[list[ChatMessage]] = []
 
@@ -1144,7 +1249,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
 
         # Log the task at run start (only if not resuming)
         if not resumed:
-            self._logger.task_message(msgs[-1].content)
+            self._logger.task_message(task_description)
 
         # Show warnings (top-level only, if logger supports it)
         if self._logger.depth == 0 and isinstance(self._logger, AgentLogger):
@@ -1163,6 +1268,8 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         total_output_tokens = 0
 
         for i in range(start_turn, self._max_turns):
+            if self._semantic_state_manager is not None:
+                self._semantic_state_manager.snapshot_turn(i + 1)
             # Capture current state for potential caching (before any async work)
             self._current_run_state = CacheState(
                 msgs=list(msgs),
@@ -1176,6 +1283,12 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                 num_turns_remaining_msg = _num_turns_remaining_msg(self._max_turns - i)
                 msgs.append(num_turns_remaining_msg)
                 self._logger.user_message(num_turns_remaining_msg)
+
+            if self._semantic_state_manager is not None and i > start_turn:
+                semantic_state_msg = UserMessage(content=self._semantic_state_manager.build_turn_context(i + 1))
+                msgs.append(semantic_state_msg)
+                self._logger.user_message(semantic_state_msg)
+                self._semantic_state_manager.clear_pending_notices()
 
             # Pass turn info to step() for real-time logging
             assistant_message, tool_messages, finish_params = await self.step(
@@ -1203,6 +1316,57 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                 self._logger.user_message(user_msg)
 
             msgs.extend([assistant_message, *tool_messages, *user_messages])
+
+            if self._semantic_state_manager is not None:
+                disputes = self._semantic_state_manager.parse_disputes(str(assistant_message.content))
+                if disputes:
+                    dispute_outcomes = self._semantic_state_manager.handle_disputes(
+                        disputes,
+                        turn_index=i + 1,
+                    )
+                    run_metadata.setdefault("semantic_state_events", []).append(
+                        {
+                            "turn": i + 1,
+                            "disputes": disputes,
+                            "outcome": dispute_outcomes,
+                        }
+                    )
+                updates = self._semantic_state_manager.parse_state_update(str(assistant_message.content))
+                if updates:
+                    self._semantic_state_manager.apply_updates(
+                        updates,
+                        written_turn=i + 1,
+                        confidence="agent",
+                    )
+                extractor_artifact = await self._run_semantic_state_extractor(
+                    assistant_message,
+                    tool_messages,
+                    i + 1,
+                )
+                self._semantic_state_manager.register_extractor_artifact(
+                    extractor_artifact,
+                    written_turn=i + 1,
+                )
+                violation_artifact = await self._run_semantic_state_auditor(
+                    assistant_message,
+                    tool_messages,
+                    i + 1,
+                )
+                violation_outcome = self._semantic_state_manager.handle_violations(
+                    violation_artifact,
+                    turn_index=i + 1,
+                )
+                run_metadata.setdefault("semantic_state_events", []).append(
+                    {
+                        "turn": i + 1,
+                        "extractor": extractor_artifact.model_dump(),
+                        "auditor": violation_artifact.model_dump(),
+                        "outcome": violation_outcome,
+                    }
+                )
+                run_metadata.setdefault("semantic_state", []).append(
+                    self._semantic_state_manager.serialize_persistent_state()
+                )
 
             if finish_params:
                 break

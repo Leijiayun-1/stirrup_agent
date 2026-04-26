@@ -11,6 +11,7 @@ prompts_dir = files("stirrup.prompts")
 # Templates that need .format() with runtime values
 MESSAGE_SUMMARIZER_BRIDGE_TEMPLATE = (prompts_dir / "message_summarizer_bridge.txt").read_text(encoding="utf-8")
 BASE_SYSTEM_PROMPT_TEMPLATE = (prompts_dir / "base_system_prompt.txt").read_text(encoding="utf-8")
+PLANNER_PROMPT_TEMPLATE = (prompts_dir / "planner_prompt.txt").read_text(encoding="utf-8")
 
 # Ready-to-use prompts (no formatting needed)
 MESSAGE_SUMMARIZER = (prompts_dir / "message_summarizer.txt").read_text(encoding="utf-8")
@@ -19,4 +20,5 @@ __all__ = [
     "BASE_SYSTEM_PROMPT_TEMPLATE",
     "MESSAGE_SUMMARIZER",
     "MESSAGE_SUMMARIZER_BRIDGE_TEMPLATE",
+    "PLANNER_PROMPT_TEMPLATE",
 ]
