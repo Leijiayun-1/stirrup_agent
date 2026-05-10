@@ -1,5 +1,8 @@
 """Tests for agent core functionality."""
 
+import json
+from pathlib import Path
+
 from pydantic import BaseModel
 
 from stirrup.constants import FINISH_TOOL_NAME
@@ -35,6 +38,33 @@ class MockLLMClient(LLMClient):
         return 100_000
 
     async def generate(self, messages: list[ChatMessage], tools: dict[str, Tool]) -> AssistantMessage:  # noqa: ARG002
+        first_content = str(messages[0].content) if messages else ""
+        if "pre-run Planner" in first_content:
+            return AssistantMessage(
+                content=json.dumps(
+                    {
+                        "task_understanding": "Test task",
+                        "deliverables": [],
+                        "phases": [
+                            {
+                                "name": "execution",
+                                "goal": "Run the test task",
+                                "turn_budget": 30,
+                                "variables_to_extract": ["final_deliverable_path"],
+                            }
+                        ],
+                        "total_turn_budget": 30,
+                        "key_rules": [],
+                        "risk_flags": [],
+                    }
+                ),
+                token_usage=TokenUsage(input=10, answer=10),
+            )
+        if "semantic-state extractor" in first_content:
+            return AssistantMessage(content='{"variables":[]}', token_usage=TokenUsage(input=10, answer=2))
+        if "semantic-state rule auditor" in first_content:
+            return AssistantMessage(content='{"violations":[]}', token_usage=TokenUsage(input=10, answer=2))
+
         response = self.responses[self.call_count]
         self.call_count += 1
         return response
@@ -493,3 +523,104 @@ async def test_allow_successive_assistant_messages() -> None:
     messages = message_history[0]
     continue_messages = [m for m in messages if isinstance(m, UserMessage) and m.content == "Please continue the task"]
     assert len(continue_messages) == 0
+
+
+async def test_runtime_env_state_tracks_uploads_generated_files_and_finish(
+    sample_file: Path,
+    temp_output_dir: Path,
+) -> None:
+    """Runtime env_state records uploaded files, generated files, and finish validation."""
+    from stirrup.tools.code_backends.local import LocalCodeExecToolProvider
+
+    responses = [
+        AssistantMessage(
+            content="I will create the requested output.",
+            tool_calls=[
+                ToolCall(
+                    name="code_exec",
+                    arguments='{"cmd": "printf hello > output.txt"}',
+                    tool_call_id="call_1",
+                )
+            ],
+            token_usage=TokenUsage(input=100, answer=50),
+        ),
+        AssistantMessage(
+            content="Done.",
+            tool_calls=[
+                ToolCall(
+                    name=FINISH_TOOL_NAME,
+                    arguments='{"reason": "Created output", "paths": ["output.txt"]}',
+                    tool_call_id="call_2",
+                )
+            ],
+            token_usage=TokenUsage(input=100, answer=50),
+        ),
+    ]
+    client = MockLLMClient(responses)
+    agent = Agent(
+        client=client,
+        name="test-agent",
+        max_turns=5,
+        tools=[LocalCodeExecToolProvider()],
+    )
+
+    async with agent.session(output_dir=temp_output_dir, input_files=[sample_file]) as session:
+        finish_params, _history, run_metadata = await session.run([UserMessage(content="Create output.txt")])
+
+    assert finish_params is not None
+    assert (temp_output_dir / "output.txt").read_text() == "hello"
+
+    state_dump = "\n".join(run_metadata["_semantic_state"])
+    assert "env.uploaded_files" in state_dump
+    assert "sample.txt" in state_dump
+    assert "env.generated_files" in state_dump
+    assert "output.txt" in state_dump
+    assert "env.finish_status" in state_dump
+    assert "validated" in state_dump
+
+
+async def test_runtime_env_state_tracks_tool_errors_and_missing_dependencies() -> None:
+    """Runtime env_state records concrete tool failures and missing Python modules."""
+    from stirrup.tools.code_backends.local import LocalCodeExecToolProvider
+
+    responses = [
+        AssistantMessage(
+            content="I will try the import.",
+            tool_calls=[
+                ToolCall(
+                    name="code_exec",
+                    arguments='{"cmd": "python -c \\"import definitely_missing_env_state_module\\""}',
+                    tool_call_id="call_1",
+                )
+            ],
+            token_usage=TokenUsage(input=100, answer=50),
+        ),
+        AssistantMessage(
+            content="I will stop after observing the environment failure.",
+            tool_calls=[
+                ToolCall(
+                    name=FINISH_TOOL_NAME,
+                    arguments='{"reason": "Observed missing dependency", "paths": []}',
+                    tool_call_id="call_2",
+                )
+            ],
+            token_usage=TokenUsage(input=100, answer=50),
+        ),
+    ]
+    client = MockLLMClient(responses)
+    agent = Agent(
+        client=client,
+        name="test-agent",
+        max_turns=5,
+        tools=[LocalCodeExecToolProvider()],
+    )
+
+    async with agent.session() as session:
+        finish_params, _history, run_metadata = await session.run([UserMessage(content="Check dependency")])
+
+    assert finish_params is not None
+    state_dump = "\n".join(run_metadata["_semantic_state"])
+    assert "env.last_tool_error" in state_dump
+    assert "missing_dependency" in state_dump
+    assert "env.missing_dependencies" in state_dump
+    assert "definitely_missing_env_state_module" in state_dump

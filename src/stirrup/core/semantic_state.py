@@ -9,6 +9,15 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+ENV_STATE_SOURCE_PRIORITY = {
+    "agent": 10,
+    "extractor": 20,
+    "tool_provider": 70,
+    "tool_runtime": 80,
+    "finish_tool": 90,
+    "runtime": 100,
+}
+
 
 class RuleSpec(BaseModel):
     rule_id: str
@@ -202,6 +211,7 @@ class SemanticStateManager:
     def serialize_current_state(self) -> str:
         lines = ["<current_state>"]
         stale_lines: list[str] = []
+        env_lines = ["<env_state>"]
         for entry in self.state_dict.values():
             summary = (
                 f"{entry.name} = {entry.value} | category={entry.category} | source={entry.source} "
@@ -211,8 +221,13 @@ class SemanticStateManager:
                 summary += f" | overwritten={len(entry.value_history)}"
             if entry.stale:
                 stale_lines.append(f"STALE {summary}")
+            elif entry.category == "env_state":
+                env_lines.append(summary)
             else:
                 lines.append(summary)
+        if len(env_lines) > 1:
+            env_lines.append("</env_state>")
+            lines.extend(env_lines)
         lines.extend(stale_lines)
         lines.append("</current_state>")
         return "\n".join(lines)
@@ -275,15 +290,28 @@ class SemanticStateManager:
             name = payload["name"]
             update_mode = payload.get("update_mode", "initial")
             derived_from = payload.get("derived_from", [])
+            category = payload["category"]
+            source = payload.get("source", "agent")
+
+            if category == "env_state" and name in self.state_dict:
+                existing = self.state_dict[name]
+                if existing.category == "env_state" and not self._env_source_can_overwrite(source, existing.source):
+                    self.pending_notices.append(
+                        f'<warn kind="env_state_low_priority_update_ignored" variable="{name}" '
+                        f'source="{self._escape_attr(source)}" existing_source="{self._escape_attr(existing.source)}"/>'
+                    )
+                    continue
+
             if name in self.state_dict:
                 update_mode = "overwrite"
 
             if update_mode == "overwrite" and name in self.state_dict:
                 entry = self.state_dict[name]
-                entry.value_history.append(entry.value)
+                if entry.category != "env_state" and category != "env_state":
+                    entry.value_history.append(entry.value)
                 entry.value = payload["value"]
-                entry.category = payload["category"]
-                entry.source = payload.get("source", entry.source)
+                entry.category = category
+                entry.source = source
                 entry.confidence = confidence
                 entry.written_turn = written_turn
                 entry.update_mode = update_mode
@@ -299,8 +327,8 @@ class SemanticStateManager:
                 entry = StateEntry(
                     name=name,
                     value=payload["value"],
-                    category=payload["category"],
-                    source=payload.get("source", "agent"),
+                    category=category,
+                    source=source,
                     confidence=confidence,
                     written_turn=written_turn,
                     update_mode=update_mode,
@@ -326,6 +354,66 @@ class SemanticStateManager:
         updates = [variable.model_dump() for variable in artifact.variables]
         if updates:
             self.apply_updates(updates, written_turn=written_turn, confidence="extractor")
+
+    def record_runtime_env_state(
+        self,
+        name: str,
+        value: Any,
+        *,
+        written_turn: int,
+        source: str = "runtime",
+        reason: str | None = None,
+        notice: str | None = None,
+    ) -> None:
+        """Write a runtime-verified env_state value with source priority protection."""
+        if isinstance(value, str):
+            serialized_value = value
+        else:
+            serialized_value = json.dumps(value, ensure_ascii=True, sort_keys=True)
+
+        self.apply_updates(
+            [
+                {
+                    "name": name,
+                    "value": serialized_value,
+                    "category": "env_state",
+                    "source": source,
+                    "update_mode": "overwrite" if name in self.state_dict else "initial",
+                    "reason": reason,
+                    "derived_from": [],
+                }
+            ],
+            written_turn=written_turn,
+            confidence="runtime_verified",
+        )
+        if notice:
+            self.pending_notices.append(notice)
+
+    def record_runtime_env_states(
+        self,
+        items: dict[str, Any],
+        *,
+        written_turn: int,
+        source: str = "runtime",
+        reason: str | None = None,
+    ) -> None:
+        for name, value in items.items():
+            self.record_runtime_env_state(
+                name,
+                value,
+                written_turn=written_turn,
+                source=source,
+                reason=reason,
+            )
+
+    def get_env_state_json(self, name: str, default: Any = None) -> Any:
+        entry = self.state_dict.get(name)
+        if entry is None or entry.category != "env_state":
+            return default
+        try:
+            return json.loads(entry.value)
+        except json.JSONDecodeError:
+            return default
 
     def handle_disputes(self, disputes: list[dict[str, str]], *, turn_index: int) -> list[dict[str, str]]:
         outcomes: list[dict[str, str]] = []
@@ -428,6 +516,9 @@ class SemanticStateManager:
             if rule.rule_id == rule_id:
                 return rule.resolution_strategy
         return "auto_patch"
+
+    def _env_source_can_overwrite(self, source: str, existing_source: str) -> bool:
+        return ENV_STATE_SOURCE_PRIORITY.get(source, 0) >= ENV_STATE_SOURCE_PRIORITY.get(existing_source, 0)
 
     def check_phase_boundary(self, turn_index: int) -> None:
         phase, _used, remaining = self.get_phase_for_turn(turn_index)
