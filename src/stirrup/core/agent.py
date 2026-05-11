@@ -1112,7 +1112,8 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                     reported_paths: list[str] = []
                     try:
                         params = self._finish_tool.parameters.model_validate_json(tool_call.arguments)
-                        reported_paths = list(params.paths)
+                        reported_paths_value = getattr(params, "paths", [])
+                        reported_paths = list(reported_paths_value) if reported_paths_value is not None else []
                         if tool_message.success:
                             finish_params = params
                     except ValidationError:
@@ -1266,6 +1267,21 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
             source="runtime",
             reason="execution environment file scan",
         )
+        self._semantic_state_manager.record_evidence(
+            turn=written_turn,
+            source="runtime",
+            kind="workspace_file_scan",
+            content=json.dumps(
+                {
+                    "workspace_files": self._summarize_file_list(workspace_files, limit=50),
+                    "generated_files": self._summarize_file_list(generated, limit=50),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            success=True,
+            metadata={"generated_count": len(generated), "workspace_count": len(workspace_files)},
+        )
 
     def _extract_tool_error(self, tool_message: ToolMessage, *, turn_index: int) -> dict[str, Any] | None:
         text = _content_to_text(tool_message.content)
@@ -1333,6 +1349,20 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         if self._semantic_state_manager is None:
             return
 
+        for index, tool_message in enumerate(tool_messages, start=1):
+            self._semantic_state_manager.record_evidence(
+                turn=turn_index,
+                source=tool_message.name or "unknown_tool",
+                kind="tool_result",
+                content=_content_to_text(tool_message.content),
+                success=tool_message.success,
+                metadata={
+                    "tool_call_id": tool_message.tool_call_id,
+                    "index": index,
+                    "args_was_valid": tool_message.args_was_valid,
+                },
+            )
+
         errors = [
             error
             for tool_message in tool_messages
@@ -1388,6 +1418,18 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
 
         if finish_attempts:
             finish_status = finish_attempts[-1]
+            self._semantic_state_manager.record_evidence(
+                turn=turn_index,
+                source=FINISH_TOOL_NAME,
+                kind="finish_validation",
+                content=json.dumps(finish_status, ensure_ascii=True, sort_keys=True),
+                success=finish_status.get("status") == "validated",
+                metadata={
+                    "reported_paths": finish_status.get("reported_paths", []),
+                    "validated_paths": finish_status.get("validated_paths", []),
+                    "missing_paths": finish_status.get("missing_paths", []),
+                },
+            )
             self._semantic_state_manager.record_runtime_env_state(
                 "env.finish_status",
                 finish_status,
@@ -1435,14 +1477,20 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         system_prompt = (
             "You are a semantic-state extractor. Return only JSON with the schema "
             '{"variables":[{"name":"...","value":"...","category":"...","source":"...",'
-            '"update_mode":"initial","reason":null,"derived_from":["..."]}]}. '
+            '"update_mode":"initial","reason":null,"derived_from":["..."],'
+            '"evidence_refs":["turn_1.evidence_1"],"matched_planned_variable_id":null}]}. '
             "Extract stable variables present in tool results or the assistant reply that are missing from current state. "
+            "Prefer canonical planned variable names when the evidence satisfies a planned variable. "
+            "Use matched_planned_variable_id when a variable name is an alias for a planned variable. "
+            "Reference evidence IDs from recent_evidence whenever a value comes from tool output. "
+            "Tool stdout alone is evidence, not completion; extract a state variable only when the value is stable. "
             "Do not repeat already-known variables unless a correction is clearly required."
         )
         user_prompt = (
             f"Turn: {turn_index}\n\n"
             f"Known variables:\n{self._semantic_state_manager.serialize_current_state()}\n\n"
-            f"Planned variables:\n{json.dumps(self._semantic_state_manager.planned_variables, ensure_ascii=True)}\n\n"
+            f"Planned variables:\n{self._semantic_state_manager.serialize_planned_variables_for_extractor()}\n\n"
+            f"Recent evidence:\n{self._semantic_state_manager.serialize_recent_evidence(limit=12)}\n\n"
             f"Assistant message:\n{_content_to_text(assistant_message.content)}\n\n"
             f"Tool results:\n{json.dumps([_content_to_text(msg.content) for msg in tool_messages], ensure_ascii=True)}"
         )
