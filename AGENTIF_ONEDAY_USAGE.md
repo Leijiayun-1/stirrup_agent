@@ -25,7 +25,7 @@ python -m pip install -e '.[agentif-oneday]'
 python -m pip install playwright
 ```
 
-当前机器已有 `/usr/bin/google-chrome`，`.env` 默认会让 browser-use 使用系统 Chrome；只有没有系统 Chrome 时才需要额外运行 `python -m playwright install chromium`。
+如果不配置 `STIRRUP_BROWSER_EXECUTABLE_PATH` 和 `STIRRUP_BROWSER_CDP_URL`，AgentIF runner 会优先使用 Playwright cache 中已有的 Chromium；如果 cache 中没有，再查找系统 PATH/常见路径下的 Chrome/Chromium；如果仍然没有，会尝试执行 `python -m playwright install chromium` 安装到 cache。
 
 如果不想安装 editable 包，也可以在运行前设置：
 
@@ -45,7 +45,8 @@ STIRRUP_BASE_URL=https://your-openai-compatible-endpoint/v1
 BRAVE_API_KEY=optional-brave-search-key
 AGENTIF_ONEDAY_DATA_ROOT=/home/shangguanyike/AgentIF-OneDay/agentif_oneday_data
 STIRRUP_BROWSER_HEADLESS=false
-STIRRUP_BROWSER_EXECUTABLE_PATH=/usr/bin/google-chrome
+STIRRUP_BROWSER_EXECUTABLE_PATH=
+STIRRUP_BROWSER_CDP_URL=
 ```
 
 `STIRRUP_API_KEY` 为空时，CLI 会继续尝试 `MODEL_API_KEY`、`OPENAI_API_KEY`、`OPENROUTER_API_KEY`。

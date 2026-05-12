@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import glob
 import json
 import os
+import platform
 import re
 import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -91,6 +100,273 @@ def parse_bool(raw: str | None, default: bool) -> bool:
     if value in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+def _is_executable_file(path: str | Path) -> bool:
+    candidate = Path(path).expanduser()
+    return candidate.exists() and candidate.is_file() and os.access(candidate, os.X_OK)
+
+
+def _playwright_cache_root() -> Path:
+    raw = os.getenv("PLAYWRIGHT_BROWSERS_PATH")
+    if raw and raw.strip() and raw.strip() != "0":
+        return Path(raw).expanduser()
+
+    system = platform.system()
+    if system == "Darwin":
+        return Path("~/Library/Caches/ms-playwright").expanduser()
+    if system == "Windows":
+        local_app_data = os.getenv("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "ms-playwright"
+    return Path("~/.cache/ms-playwright").expanduser()
+
+
+def _latest_globbed_executable(pattern: str) -> str | None:
+    matches = sorted(glob.glob(str(Path(pattern).expanduser())))
+    for match in reversed(matches):
+        if _is_executable_file(match):
+            return str(Path(match).resolve())
+    return None
+
+
+def _find_playwright_cached_browser(*, include_headless_shell: bool) -> str | None:
+    cache_root = _playwright_cache_root()
+    system = platform.system()
+    if system == "Darwin":
+        patterns = [
+            cache_root / "chromium-*" / "chrome-mac" / "Chromium.app" / "Contents" / "MacOS" / "Chromium",
+        ]
+        if include_headless_shell:
+            patterns.append(
+                cache_root
+                / "chromium_headless_shell-*"
+                / "chrome-mac"
+                / "Chromium.app"
+                / "Contents"
+                / "MacOS"
+                / "Chromium"
+            )
+    elif system == "Windows":
+        patterns = [
+            cache_root / "chromium-*" / "chrome-win" / "chrome.exe",
+        ]
+        if include_headless_shell:
+            patterns.append(cache_root / "chromium_headless_shell-*" / "chrome-win" / "chrome.exe")
+    else:
+        patterns = [
+            cache_root / "chromium-*" / "chrome-linux*" / "chrome",
+        ]
+        if include_headless_shell:
+            patterns.append(cache_root / "chromium_headless_shell-*" / "chrome-linux*" / "chrome")
+
+    for pattern in patterns:
+        if match := _latest_globbed_executable(str(pattern)):
+            return match
+    return None
+
+
+def _find_system_browser() -> str | None:
+    names = [
+        "google-chrome-stable",
+        "google-chrome",
+        "chromium",
+        "chromium-browser",
+        "google-chrome-beta",
+        "google-chrome-dev",
+        "brave-browser",
+        "microsoft-edge",
+    ]
+    for name in names:
+        path = shutil.which(name)
+        if path and _is_executable_file(path):
+            return str(Path(path).resolve())
+
+    system_paths = [
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/local/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+        "/usr/local/bin/chromium",
+        "/snap/bin/chromium",
+        "/usr/bin/google-chrome-beta",
+        "/usr/bin/google-chrome-dev",
+        "/usr/bin/brave-browser",
+    ]
+    if platform.system() == "Darwin":
+        system_paths = [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        ]
+    elif platform.system() == "Windows":
+        system_paths = [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Chromium\Application\chrome.exe",
+            r"C:\Program Files (x86)\Chromium\Application\chrome.exe",
+            r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        ]
+
+    for path in system_paths:
+        expanded = os.path.expandvars(path)
+        if _is_executable_file(expanded):
+            return str(Path(expanded).resolve())
+    return None
+
+
+def _install_playwright_chromium() -> None:
+    try:
+        subprocess.run(  # noqa: S603
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=600,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("Timed out while installing Playwright Chromium") from exc
+    except subprocess.CalledProcessError as exc:
+        message = (exc.stderr or exc.stdout or str(exc)).strip()
+        raise RuntimeError(f"Failed to install Playwright Chromium: {message}") from exc
+
+
+def resolve_browser_executable_path(
+    *,
+    explicit_path: str | None,
+    cdp_url: str | None,
+    headless: bool,
+    install_if_missing: bool = True,
+) -> str | None:
+    """Resolve browser priority: explicit path/CDP, Playwright cache, system path, Playwright install."""
+    if cdp_url:
+        return explicit_path
+
+    if explicit_path:
+        return explicit_path
+
+    if cached := _find_playwright_cached_browser(include_headless_shell=headless):
+        return cached
+
+    if system_browser := _find_system_browser():
+        return system_browser
+
+    if not install_if_missing:
+        return None
+
+    _install_playwright_chromium()
+    return _find_playwright_cached_browser(include_headless_shell=headless)
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _ensure_localhost_no_proxy() -> None:
+    required = {"127.0.0.1", "localhost", "::1"}
+    for key in ("NO_PROXY", "no_proxy"):
+        existing = {
+            item.strip()
+            for item in os.getenv(key, "").split(",")
+            if item.strip()
+        }
+        combined = sorted(existing | required)
+        os.environ[key] = ",".join(combined)
+
+
+def _wait_for_cdp(port: int, *, timeout_seconds: float = 45.0) -> str:
+    url = f"http://127.0.0.1:{port}/json/version"
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    while time.monotonic() < deadline:
+        try:
+            with opener.open(url, timeout=1) as response:
+                if response.status == 200:
+                    return f"http://127.0.0.1:{port}"
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            last_error = exc
+            time.sleep(0.25)
+    raise RuntimeError(f"Timed out waiting for prelaunched Chromium CDP on port {port}: {last_error}")
+
+
+def _terminate_browser_process(process: subprocess.Popen[Any] | None) -> None:
+    if process is None or process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(timeout=5)
+
+
+def _prelaunch_chromium_cdp(
+    *,
+    executable_path: str,
+    profile_dir: Path,
+    headless: bool,
+    browser_user_agent: str | None,
+    browser_timezone: str | None,
+) -> tuple[str, subprocess.Popen[Any]]:
+    """Launch Chromium directly and return a CDP URL for browser-use to attach to."""
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    port = _find_free_port()
+    args = [
+        executable_path,
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--disable-gpu-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-blink-features=AutomationControlled",
+        "--window-size=1920,1080",
+        "--lang=en-US,en",
+    ]
+    if headless:
+        args.append("--headless=new")
+    if browser_user_agent:
+        args.append(f"--user-agent={browser_user_agent}")
+    if browser_timezone:
+        args.append(f"--timezone={browser_timezone}")
+
+    proxy = (os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or os.getenv("ALL_PROXY") or "").strip()
+    if proxy:
+        args.append(f"--proxy-server={proxy}")
+
+    stderr_log_path = profile_dir / "chromium_stderr.log"
+    stderr_log = stderr_log_path.open("a", encoding="utf-8")
+    try:
+        process = subprocess.Popen(  # noqa: S603
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=stderr_log,
+            text=True,
+        )
+    finally:
+        stderr_log.close()
+    try:
+        cdp_url = _wait_for_cdp(port)
+    except Exception as exc:
+        _terminate_browser_process(process)
+        stderr_tail = ""
+        with contextlib.suppress(Exception):
+            stderr_tail = stderr_log_path.read_text(encoding="utf-8", errors="replace")[-4000:]
+        raise RuntimeError(f"Failed to prelaunch Chromium from {executable_path}: {exc}\n{stderr_tail}") from exc
+    return cdp_url, process
 
 
 def infer_required_outputs(task: AgentIFTask) -> list[str]:
@@ -473,6 +749,10 @@ async def run_task(
         "max_turns": max_turns,
         "client_timeout_seconds": client_timeout_seconds,
         "web_timeout_seconds": web_timeout_seconds,
+        "browser_headless": browser_headless,
+        "browser_executable_path_requested": browser_executable_path or "",
+        "browser_cdp_url": browser_cdp_url or "",
+        "browser_profile_dir": str(browser_profile_dir) if browser_profile_dir is not None else "",
     }
     (task_out / "stirrup_payload.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
@@ -489,17 +769,45 @@ async def run_task(
             "error": None,
         }
 
+    _ensure_localhost_no_proxy()
     code_provider = LocalCodeExecToolProvider()
     if browser_profile_dir is not None:
         browser_profile_dir.mkdir(parents=True, exist_ok=True)
 
+    resolved_browser_executable_path = resolve_browser_executable_path(
+        explicit_path=browser_executable_path,
+        cdp_url=browser_cdp_url,
+        headless=browser_headless,
+    )
+    prelaunched_browser_process: subprocess.Popen[Any] | None = None
+    resolved_browser_cdp_url = browser_cdp_url
+    if resolved_browser_cdp_url is None and resolved_browser_executable_path:
+        profile_root = browser_profile_dir or (task_out / ".browser_profile")
+        runtime_profile_dir = profile_root / "runtime_profiles" / (
+            f"{task.question_id}-{os.getpid()}-{int(time.time() * 1000)}"
+        )
+        resolved_browser_cdp_url, prelaunched_browser_process = _prelaunch_chromium_cdp(
+            executable_path=resolved_browser_executable_path,
+            profile_dir=runtime_profile_dir,
+            headless=browser_headless,
+            browser_user_agent=browser_user_agent,
+            browser_timezone=browser_timezone,
+        )
+    payload["browser_executable_path_resolved"] = resolved_browser_executable_path or ""
+    payload["browser_cdp_url_resolved"] = resolved_browser_cdp_url or ""
+    payload["browser_prelaunched"] = bool(prelaunched_browser_process)
+    (task_out / "stirrup_payload.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
     browser_provider = PersistingBrowserUseToolProvider(
         code_provider=code_provider,
         headless=browser_headless,
-        executable_path=browser_executable_path,
-        cdp_url=browser_cdp_url,
+        executable_path=None if resolved_browser_cdp_url else resolved_browser_executable_path,
+        cdp_url=resolved_browser_cdp_url,
         extra_args=_build_browser_extra_args(
-            profile_dir=browser_profile_dir,
+            profile_dir=None if resolved_browser_cdp_url else browser_profile_dir,
             browser_user_agent=browser_user_agent,
             browser_timezone=browser_timezone,
         ),
@@ -593,3 +901,5 @@ async def run_task(
             "generated_files": _list_generated_files(task_out),
             "output_dir": str(task_out),
         }
+    finally:
+        _terminate_browser_process(prelaunched_browser_process)
