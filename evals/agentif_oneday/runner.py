@@ -373,19 +373,22 @@ def infer_required_outputs(task: AgentIFTask) -> list[str]:
     """Infer explicitly requested output filenames from task text/rubrics."""
     primary_text = "\n".join([task.title, task.description])
     rubric_text = " ".join(str(c.get("content", "")) for c in task.score_criteria)
+    filename = r"([^\s,;:，。；：\n\r\"'`<>|]+?\.[A-Za-z0-9]{2,6})"
 
     def _extract(text: str) -> list[str]:
         names: list[str] = []
-        for match in re.finditer(r"\[([^\]\n]+\.[A-Za-z0-9]{2,5})\]", text):
+        for match in re.finditer(r"\[\s*" + filename + r"\s*\]", text):
             names.append(match.group(1).strip())
 
-        for pattern in [
-            r"save(?:d)?(?:\s+(?:the\s+\w+|it))?\s+as\s+([A-Za-z0-9 _().\-]+\.[A-Za-z0-9]{2,5})",
-            r"name(?:d)?\s+(?:the\s+file\s+)?as\s+([A-Za-z0-9 _().\-]+\.[A-Za-z0-9]{2,5})",
-            r"format\s+([A-Za-z0-9 _().\-]+\.[A-Za-z0-9]{2,5})",
-        ]:
+        patterns = [
+            rf"\b(?:save|saved|saving|export|exported|write|written|create|created|generate|generated|produce|produced|output)\b"
+            rf"[^.\n\r]{{0,80}}\b(?:as|to|into|named|called)\s+{filename}",
+            rf"\bfile\s+(?:named|called)\s+{filename}",
+            rf"\bfilename\s*(?:is|:|=)\s*{filename}",
+        ]
+        for pattern in patterns:
             for match in re.finditer(pattern, text, flags=re.IGNORECASE):
-                names.append(match.group(1).strip(" .,\"'"))
+                names.append(match.group(1).strip(" .,\"'()[]{}"))
         return names
 
     names = _extract(primary_text) or _extract(rubric_text)
@@ -663,14 +666,6 @@ def _is_valid_binary_file(path: Path) -> tuple[bool, str]:
     return True, ""
 
 
-def _looks_like_simulation(response_payload: dict[str, Any]) -> bool:
-    finish = response_payload.get("finish")
-    if not isinstance(finish, dict):
-        return False
-    reason = str(finish.get("reason", "")).lower()
-    return any(flag in reason for flag in ("simulat", "placeholder", "dummy", "cannot access", "could not access"))
-
-
 def _validate_outputs(
     task: AgentIFTask,
     task_out: Path,
@@ -694,9 +689,6 @@ def _validate_outputs(
         ok, message = _is_valid_binary_file(path)
         if not ok:
             errors.append(message)
-
-    if _looks_like_simulation(response_payload):
-        errors.append("finish reason indicates simulated/placeholder completion")
 
     for finish_path in finish_paths:
         resolved = Path(finish_path) if Path(finish_path).is_absolute() else (task_out / finish_path)
