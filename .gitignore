@@ -7,6 +7,7 @@ __pycache__/
 *.so
 
 # Distribution / packaging
+.browser_profile/
 .Python
 build/
 develop-eggs/
@@ -20,6 +21,7 @@ parts/
 sdist/
 var/
 wheels/
+out/
 share/python-wheels/
 *.egg-info/
 .installed.cfg

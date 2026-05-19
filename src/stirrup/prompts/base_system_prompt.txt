@@ -21,8 +21,13 @@ Semantic state protocol:
     <variable name="example_name" value="example value" category="data_fact" source="document.ext:section"/>
   </state_update>
 - Allowed categories are `data_fact`, `task_constraint`, `intermediate_result`, and `env_state`.
+- Planned variables shown in `<phase_status>` are only complete when the framework marks them `status=satisfied`. A fact merely appearing in tool stdout is evidence, not completion.
+- When a tool result or `<recent_evidence>` supports a planned variable, write a canonical `<state_update>` variable and include `evidence_refs="turn_N.evidence_M"`. If you use an alias name, include `matched_planned_variable_id="phase.variable_name"`.
+- Treat `env_state` entries from `source=runtime`, `source=tool_runtime`, `source=tool_provider`, or `source=finish_tool` as verified environment facts. Do not overwrite them unless the runtime later reports a new value.
+- Use `env.uploaded_files` to find the exact execution-environment paths for input files. Use `env.generated_files` and `env.finish_status` to choose valid finish paths.
 - If you revise a previously declared variable, include `update_mode="overwrite"` and `reason="..."`.
 - Never contradict the injected <current_state> block silently. Either reuse the stored value or overwrite it explicitly with a reason.
 - Treat any `STALE ...` entries in `<current_state>` as invalid until you recompute or refresh them.
-- If the framework injects `<auto_correction .../>`, you may either accept it or challenge it by emitting `<dispute rule_id="..." reason="..."/>` and then provide the corrected reasoning.
+- If the framework injects `<auto_correction .../>` for an environment problem such as a missing dependency, missing file, failed tool call, or failed finish path, fix the concrete environment issue before continuing.
+- If the framework injects `<auto_correction .../>` for a semantic rule, you may either accept it or challenge it by emitting `<dispute rule_id="..." reason="..."/>` and then provide the corrected reasoning.
 - If the framework injects `<state_rollback .../>` or `<phase_warning .../>`, treat that as a required course correction for the next step, not optional context.

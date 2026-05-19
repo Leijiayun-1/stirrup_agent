@@ -1,4 +1,5 @@
 # Context var for passing parent depth to sub-agent executors
+import ast
 import contextvars
 import glob as glob_module
 import inspect
@@ -48,6 +49,7 @@ from stirrup.tools.code_backends.base import CodeExecToolProvider
 from stirrup.tools.code_backends.local import LocalCodeExecToolProvider
 from stirrup.tools.finish import SIMPLE_FINISH_TOOL
 from stirrup.utils.logging import AgentLogger, AgentLoggerBase
+from stirrup.utils.text import truncate_msg
 
 _PARENT_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar("parent_depth", default=0)
 
@@ -81,6 +83,8 @@ class SessionState:
     depth: int = 0
     exec_env_owned: bool = True  # Whether this session owns (and should cleanup) the exec_env
     uploaded_file_paths: list[str] = field(default_factory=list)  # Paths of files uploaded to exec_env
+    uploaded_file_records: list[dict[str, Any]] = field(default_factory=list)
+    generated_files_snapshot: list[str] = field(default_factory=list)
     skills_metadata: list[SkillMetadata] = field(default_factory=list)  # Loaded skills metadata
     logger: AgentLoggerBase | None = None  # Logger for pause/resume during user input
 
@@ -772,6 +776,15 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                             state.uploaded_file_paths = [str(self._pending_input_files)]
                         else:
                             state.uploaded_file_paths = [str(p) for p in self._pending_input_files]
+                        state.uploaded_file_records = [
+                            {
+                                "source_path": path,
+                                "dest_path": path,
+                                "size": None,
+                                "status": "shared_parent_exec_env",
+                            }
+                            for path in state.uploaded_file_paths
+                        ]
                         logger.debug(
                             "[%s __aenter__] Shared exec_env - files already accessible: %s",
                             self._name,
@@ -791,6 +804,15 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                             result.failed,
                         )
                         state.uploaded_file_paths = [uf.dest_path for uf in result.uploaded]
+                        state.uploaded_file_records = [
+                            {
+                                "source_path": str(uf.source_path),
+                                "dest_path": uf.dest_path,
+                                "size": uf.size,
+                                "status": "uploaded",
+                            }
+                            for uf in result.uploaded
+                        ]
                         if result.failed:
                             raise RuntimeError(f"Failed to upload files: {result.failed}")
                 else:
@@ -804,6 +826,15 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                         result.failed,
                     )
                     state.uploaded_file_paths = [uf.dest_path for uf in result.uploaded]
+                    state.uploaded_file_records = [
+                        {
+                            "source_path": str(uf.source_path),
+                            "dest_path": uf.dest_path,
+                            "size": uf.size,
+                            "status": "uploaded",
+                        }
+                        for uf in result.uploaded
+                    ]
                     if result.failed:
                         raise RuntimeError(f"Failed to upload files: {result.failed}")
             self._pending_input_files = None  # Clear pending state
@@ -1050,7 +1081,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         run_metadata: dict[str, list[Any]],
         turn: int = 0,
         max_turns: int = 0,
-    ) -> tuple[AssistantMessage, list[ToolMessage], FinishParams | None]:
+    ) -> tuple[AssistantMessage, list[ToolMessage], FinishParams | None, list[dict[str, Any]]]:
         """Execute one agent step: generate assistant message and run any requested tool calls.
 
         Args:
@@ -1069,6 +1100,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
             self._logger.assistant_message(turn, max_turns, assistant_message)
 
         finish_params: FinishParams | None = None
+        finish_attempts: list[dict[str, Any]] = []
         tool_messages: list[ToolMessage] = []
         if assistant_message.tool_calls:
             tool_messages = []
@@ -1076,13 +1108,40 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                 tool_message = await self.run_tool(tool_call, run_metadata)
                 tool_messages.append(tool_message)
 
-                if tool_message.success and tool_message.name == FINISH_TOOL_NAME:
-                    finish_params = self._finish_tool.parameters.model_validate_json(tool_call.arguments)
+                if tool_message.name == FINISH_TOOL_NAME:
+                    reported_paths: list[str] = []
+                    try:
+                        params = self._finish_tool.parameters.model_validate_json(tool_call.arguments)
+                        reported_paths_value = getattr(params, "paths", [])
+                        reported_paths = list(reported_paths_value) if reported_paths_value is not None else []
+                        if tool_message.success:
+                            finish_params = params
+                    except ValidationError:
+                        params = None
+                    missing_paths: list[str] = []
+                    missing_match = re.search(r"Files do not exist: (\[.*?\])", _content_to_text(tool_message.content))
+                    if missing_match:
+                        try:
+                            parsed_missing = ast.literal_eval(missing_match.group(1))
+                            if isinstance(parsed_missing, list):
+                                missing_paths = [str(item) for item in parsed_missing]
+                        except Exception:
+                            missing_paths = []
+                    finish_attempts.append(
+                        {
+                            "turn": turn,
+                            "status": "validated" if tool_message.success else "failed",
+                            "reported_paths": reported_paths,
+                            "validated_paths": reported_paths if tool_message.success else [],
+                            "missing_paths": missing_paths,
+                            "message": truncate_msg(_content_to_text(tool_message.content), 1000),
+                        }
+                    )
 
                 # Log tool result immediately
                 self._logger.tool_result(tool_message)
 
-        return assistant_message, tool_messages, finish_params
+        return assistant_message, tool_messages, finish_params, finish_attempts
 
     async def summarize_messages(self, messages: list[ChatMessage]) -> list[ChatMessage]:
         """Condense message history using LLM to stay within context window."""
@@ -1102,6 +1161,299 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         self._logger.context_summarization_complete(summary_content, summary_bridge_prompt)
 
         return [*task_context, summary_bridge, acknowledgement_msg]
+
+    def _get_browser_runtime_config(self) -> dict[str, Any] | None:
+        for tool in self._tools:
+            if type(tool).__name__ != "BrowserUseToolProvider" and not hasattr(tool, "_tool_prefix"):
+                continue
+            tool_prefix = getattr(tool, "_tool_prefix", "")
+            if tool_prefix and not any(name.startswith(f"{tool_prefix}_") for name in self._active_tools):
+                continue
+            return {
+                "provider": type(tool).__name__,
+                "headless": getattr(tool, "_headless", None),
+                "executable_path": getattr(tool, "_executable_path", None),
+                "cdp_url": getattr(tool, "_cdp_url", None),
+                "use_cloud": getattr(tool, "_use_cloud", None),
+            }
+        return None
+
+    def _summarize_file_list(self, paths: list[str], *, limit: int = 200) -> dict[str, Any]:
+        paths = sorted(dict.fromkeys(paths))
+        return {
+            "count": len(paths),
+            "paths": paths[:limit],
+            "truncated": len(paths) > limit,
+        }
+
+    def _escape_notice_attr(self, value: str) -> str:
+        return value.replace('"', "'")
+
+    async def _record_initial_env_state(self, *, written_turn: int) -> None:
+        if self._semantic_state_manager is None:
+            return
+        state = _SESSION_STATE.get(None)
+        if state is None:
+            return
+
+        active_tool_names = sorted(self._active_tools)
+        browser_config = self._get_browser_runtime_config()
+        facts: dict[str, Any] = {
+            "env.output_dir": state.output_dir or "",
+            "env.exec_environment": {
+                "available": state.exec_env is not None,
+                "type": type(state.exec_env).__name__ if state.exec_env else None,
+                "owned": state.exec_env_owned,
+                "depth": state.depth,
+                "temp_dir": str(state.exec_env.temp_dir) if state.exec_env and state.exec_env.temp_dir else None,
+                "path_policy": "Use relative paths inside the execution environment.",
+            },
+            "env.exec_cwd": {
+                "display": ".",
+                "temp_dir": str(state.exec_env.temp_dir) if state.exec_env and state.exec_env.temp_dir else None,
+                "path_policy": "Use relative paths from the execution environment root.",
+            },
+            "env.uploaded_files": state.uploaded_file_records,
+            "env.tool_availability": {
+                "active_tools": active_tool_names,
+                "code_exec": state.exec_env is not None and "code_exec" in self._active_tools,
+                "browser": any(name.startswith("browser_") for name in self._active_tools),
+                "web_fetch": "fetch_web_page" in self._active_tools,
+                "web_search": "web_search" in self._active_tools,
+                "view_image": "view_image" in self._active_tools,
+                "finish": FINISH_TOOL_NAME in self._active_tools,
+            },
+            "env.browser": {"available": False} if browser_config is None else {"available": True, **browser_config},
+        }
+        self._semantic_state_manager.record_runtime_env_states(
+            facts,
+            written_turn=written_turn,
+            source="runtime",
+            reason="session initialized",
+        )
+        await self._record_generated_files_env_state(written_turn=written_turn)
+
+    async def _record_generated_files_env_state(self, *, written_turn: int) -> None:
+        if self._semantic_state_manager is None:
+            return
+        state = _SESSION_STATE.get(None)
+        if state is None or state.exec_env is None:
+            return
+        try:
+            workspace_files = await state.exec_env.list_files(".")
+        except Exception as exc:
+            self._semantic_state_manager.record_runtime_env_state(
+                "env.generated_files_scan_error",
+                {"error": str(exc), "turn": written_turn},
+                written_turn=written_turn,
+                source="runtime",
+                reason="failed to scan execution environment files",
+            )
+            return
+
+        uploaded = set(state.uploaded_file_paths)
+        generated = [
+            path
+            for path in workspace_files
+            if path not in uploaded and not path.startswith("skills/")
+        ]
+        state.generated_files_snapshot = generated
+        self._semantic_state_manager.record_runtime_env_states(
+            {
+                "env.workspace_files": self._summarize_file_list(workspace_files),
+                "env.generated_files": self._summarize_file_list(generated),
+            },
+            written_turn=written_turn,
+            source="runtime",
+            reason="execution environment file scan",
+        )
+        self._semantic_state_manager.record_evidence(
+            turn=written_turn,
+            source="runtime",
+            kind="workspace_file_scan",
+            content=json.dumps(
+                {
+                    "workspace_files": self._summarize_file_list(workspace_files, limit=50),
+                    "generated_files": self._summarize_file_list(generated, limit=50),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+            ),
+            success=True,
+            metadata={"generated_count": len(generated), "workspace_count": len(workspace_files)},
+        )
+
+    def _extract_tool_error(self, tool_message: ToolMessage, *, turn_index: int) -> dict[str, Any] | None:
+        text = _content_to_text(tool_message.content)
+        tool_name = tool_message.name or "unknown"
+        error: dict[str, Any] | None = None
+
+        if not tool_message.args_was_valid:
+            error = {
+                "tool": tool_name,
+                "turn": turn_index,
+                "error_type": "invalid_tool_arguments",
+                "message": "Tool arguments failed schema validation.",
+            }
+        elif not tool_message.success:
+            error = {
+                "tool": tool_name,
+                "turn": turn_index,
+                "error_type": "tool_failed",
+                "message": truncate_msg(text, 1000),
+            }
+
+        if tool_name == "code_exec":
+            error_kind_match = re.search(r"<error_kind>(.*?)</error_kind>", text, flags=re.DOTALL)
+            exit_code_match = re.search(r"<exit_code>(-?\d+)</exit_code>", text)
+            stderr_match = re.search(r"<stderr>(.*?)</stderr>", text, flags=re.DOTALL)
+            details_match = re.search(r"<details>(.*?)</details>", text, flags=re.DOTALL)
+            stderr = (stderr_match or details_match).group(1).strip() if (stderr_match or details_match) else ""
+            exit_code = int(exit_code_match.group(1)) if exit_code_match else None
+            if error_kind_match or (exit_code is not None and exit_code != 0):
+                error = {
+                    "tool": tool_name,
+                    "turn": turn_index,
+                    "error_type": error_kind_match.group(1).strip() if error_kind_match else "command_failed",
+                    "exit_code": exit_code,
+                    "message": truncate_msg(stderr or text, 1000),
+                }
+
+        if error is None:
+            return None
+
+        missing_module_match = re.search(r"No module named ['\"]([^'\"]+)['\"]", text)
+        if missing_module_match:
+            error["missing_dependency"] = missing_module_match.group(1)
+            error["error_type"] = "missing_dependency"
+        elif "ModuleNotFoundError" in text:
+            error["error_type"] = "missing_dependency"
+        elif "FileNotFoundError" in text or "No such file or directory" in text or "not found" in text.lower():
+            error["error_type"] = "path_or_file_not_found"
+        elif "PermissionError" in text or "permission denied" in text.lower():
+            error["error_type"] = "permission_error"
+        elif "timed out" in text.lower() or error.get("error_type") == "timeout":
+            error["error_type"] = "timeout"
+        elif tool_name in {"fetch_web_page", "web_search"}:
+            error["error_type"] = "network_or_web_error"
+
+        return error
+
+    async def _record_tool_env_state(
+        self,
+        tool_messages: list[ToolMessage],
+        *,
+        turn_index: int,
+        finish_attempts: list[dict[str, Any]] | None = None,
+    ) -> None:
+        if self._semantic_state_manager is None:
+            return
+
+        for index, tool_message in enumerate(tool_messages, start=1):
+            self._semantic_state_manager.record_evidence(
+                turn=turn_index,
+                source=tool_message.name or "unknown_tool",
+                kind="tool_result",
+                content=_content_to_text(tool_message.content),
+                success=tool_message.success,
+                metadata={
+                    "tool_call_id": tool_message.tool_call_id,
+                    "index": index,
+                    "args_was_valid": tool_message.args_was_valid,
+                },
+            )
+
+        errors = [
+            error
+            for tool_message in tool_messages
+            if (error := self._extract_tool_error(tool_message, turn_index=turn_index)) is not None
+        ]
+        if errors:
+            latest = errors[-1]
+            self._semantic_state_manager.record_runtime_env_state(
+                "env.last_tool_error",
+                latest,
+                written_turn=turn_index,
+                source="tool_runtime",
+                reason="tool failure detected by runtime",
+                notice=(
+                    f'<auto_correction rule_id="env_last_tool_error" '
+                    f'reason="{self._escape_notice_attr(str(latest.get("message", latest)))}"/>'
+                ),
+            )
+
+            missing_dependencies = self._semantic_state_manager.get_env_state_json("env.missing_dependencies", [])
+            if not isinstance(missing_dependencies, list):
+                missing_dependencies = []
+            known = {
+                item.get("module") for item in missing_dependencies
+                if isinstance(item, dict)
+            }
+            changed = False
+            for error in errors:
+                module = error.get("missing_dependency")
+                if module and module not in known:
+                    missing_dependencies.append(
+                        {
+                            "module": module,
+                            "tool": error.get("tool"),
+                            "turn": turn_index,
+                            "status": "missing",
+                        }
+                    )
+                    known.add(module)
+                    changed = True
+            if changed:
+                self._semantic_state_manager.record_runtime_env_state(
+                    "env.missing_dependencies",
+                    missing_dependencies,
+                    written_turn=turn_index,
+                    source="tool_runtime",
+                    reason="ModuleNotFoundError detected in code execution",
+                    notice=(
+                        '<auto_correction rule_id="env_missing_dependency" '
+                        'reason="A required Python dependency is missing; install it in code_exec or use an available alternative."/>'
+                    ),
+                )
+
+        if finish_attempts:
+            finish_status = finish_attempts[-1]
+            self._semantic_state_manager.record_evidence(
+                turn=turn_index,
+                source=FINISH_TOOL_NAME,
+                kind="finish_validation",
+                content=json.dumps(finish_status, ensure_ascii=True, sort_keys=True),
+                success=finish_status.get("status") == "validated",
+                metadata={
+                    "reported_paths": finish_status.get("reported_paths", []),
+                    "validated_paths": finish_status.get("validated_paths", []),
+                    "missing_paths": finish_status.get("missing_paths", []),
+                },
+            )
+            self._semantic_state_manager.record_runtime_env_state(
+                "env.finish_status",
+                finish_status,
+                written_turn=turn_index,
+                source="finish_tool",
+                reason="finish tool result",
+                notice=(
+                    '<auto_correction rule_id="env_finish_failed" '
+                    'reason="Finish failed; verify reported paths exist and call finish again."/>'
+                    if finish_status.get("status") != "validated" else None
+                ),
+            )
+            self._semantic_state_manager.record_runtime_env_states(
+                {
+                    "env.finish.reported_paths": finish_status.get("reported_paths", []),
+                    "env.finish.validated_paths": finish_status.get("validated_paths", []),
+                    "env.finish.missing_paths": finish_status.get("missing_paths", []),
+                },
+                written_turn=turn_index,
+                source="finish_tool",
+                reason="finish tool path validation",
+            )
+
+        await self._record_generated_files_env_state(written_turn=turn_index)
 
     async def _semantic_state_json_call(self, system_prompt: str, user_prompt: str) -> dict[str, Any] | None:
         response = await self._client.generate(
@@ -1125,14 +1477,20 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
         system_prompt = (
             "You are a semantic-state extractor. Return only JSON with the schema "
             '{"variables":[{"name":"...","value":"...","category":"...","source":"...",'
-            '"update_mode":"initial","reason":null,"derived_from":["..."]}]}. '
+            '"update_mode":"initial","reason":null,"derived_from":["..."],'
+            '"evidence_refs":["turn_1.evidence_1"],"matched_planned_variable_id":null}]}. '
             "Extract stable variables present in tool results or the assistant reply that are missing from current state. "
+            "Prefer canonical planned variable names when the evidence satisfies a planned variable. "
+            "Use matched_planned_variable_id when a variable name is an alias for a planned variable. "
+            "Reference evidence IDs from recent_evidence whenever a value comes from tool output. "
+            "Tool stdout alone is evidence, not completion; extract a state variable only when the value is stable. "
             "Do not repeat already-known variables unless a correction is clearly required."
         )
         user_prompt = (
             f"Turn: {turn_index}\n\n"
             f"Known variables:\n{self._semantic_state_manager.serialize_current_state()}\n\n"
-            f"Planned variables:\n{json.dumps(self._semantic_state_manager.planned_variables, ensure_ascii=True)}\n\n"
+            f"Planned variables:\n{self._semantic_state_manager.serialize_planned_variables_for_extractor()}\n\n"
+            f"Recent evidence:\n{self._semantic_state_manager.serialize_recent_evidence(limit=12)}\n\n"
             f"Assistant message:\n{_content_to_text(assistant_message.content)}\n\n"
             f"Tool results:\n{json.dumps([_content_to_text(msg.content) for msg in tool_messages], ensure_ascii=True)}"
         )
@@ -1255,6 +1613,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
             plan_artifact = await planner.plan(task_description=task_description, uploaded_files=uploaded_files)
             self._semantic_state_manager = SemanticStateManager(plan_artifact)
             run_metadata.setdefault("_planner", []).append(plan_artifact.model_dump())
+            await self._record_initial_env_state(written_turn=0)
 
             # Build the complete system prompt (base + input files + user instructions)
             full_system_prompt = self._build_system_prompt()
@@ -1317,7 +1676,7 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
                 self._semantic_state_manager.clear_pending_notices()
 
             # Pass turn info to step() for real-time logging
-            assistant_message, tool_messages, finish_params = await self.step(
+            assistant_message, tool_messages, finish_params, finish_attempts = await self.step(
                 msgs,
                 run_metadata,
                 turn=i + 1,
@@ -1344,6 +1703,11 @@ class Agent[FinishParams: BaseModel, FinishMeta]:
             msgs.extend([assistant_message, *tool_messages, *user_messages])
 
             if self._semantic_state_manager is not None:
+                await self._record_tool_env_state(
+                    tool_messages,
+                    turn_index=i + 1,
+                    finish_attempts=finish_attempts,
+                )
                 disputes = self._semantic_state_manager.parse_disputes(str(assistant_message.content))
                 if disputes:
                     dispute_outcomes = self._semantic_state_manager.handle_disputes(
